@@ -1,0 +1,22 @@
+{
+  "imports": {
+    "playwright": "npm:playwright@1.55.0"
+  },
+  "tasks": {
+    "login": "deno run -A main.ts login",
+    "status": "deno run -A main.ts status",
+    "in": "deno run -A main.ts in",
+    "out": "deno run -A main.ts out",
+    "check": "deno check ./**/*.ts",
+    "fmt": "deno fmt",
+    "lint": "deno lint",
+    "ci": "deno task check && deno task lint && deno task fmt --check"
+  },
+  "fmt": {
+    "useTabs": false,
+    "lineWidth": 100,
+    "indentWidth": 2,
+    "singleQuote": false
+  },
+  "lock": false
+}
