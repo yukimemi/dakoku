@@ -2,19 +2,26 @@
 // =============================================================================
 // File        : main.ts
 // Author      : yukimemi
-// Last Change : 2026/09/05
+// Last Change : 2026/09/14
 // =============================================================================
 //
 // ジョブカンの入室 / 退室打刻を minipc から実行する。
 //
-// ★ 資格情報をこのリポジトリに置かない。ID/パスワードを保存する代わりに
-//   **永続プロファイル**（Chromium の user-data-dir）に一度だけ手で
-//   ログインし、以後はそのセッションを使い回す。ジョブカンIDが SSO / 2FA でも
-//   これなら通る（自動ログインを組むと 2FA で必ず詰む）。
+// ★ ジョブカンのセッションは 30 分で切れる（サービス側の仕様）上、認証
+//   クッキーはセッションクッキー（expires=-1）でブラウザプロセスの終了と
+//   ともに消える。「一度ログインして以後使い回す」は成立しないので、
+//   打刻の**直前に毎回** ID/パスワードでサインインしてから打刻ページへ
+//   進む。ログインからボタンクリックまでは数十秒なので 30 分には十分
+//   間に合う。対象アカウントは ID/パスワードのみで SSO も 2FA も無い。
+//
+// ★ 資格情報をこのリポジトリに置かない。%LOCALAPPDATA%\kanade-dakoku\ 配下の
+//   平文ファイル jobcan-email.txt / jobcan-password.txt から読む（ntfy の
+//   トークンファイルと同じディレクトリ・同じ扱い）。ファイルが無い/空なら
+//   設定漏れとして明示的なメッセージで異常終了する。
 //
 //     deno task install   # Chromium を取得（初回のみ）
-//     deno task login     # ブラウザが開く。手でログインして放置。自動で閉じる
-//     deno task status    # ログイン状態と打刻ページの操作候補を JSON で出す
+//     deno task login     # 手動ログイン確認用（自動ログインの疎通確認に使う。省略可）
+//     deno task status    # サインインして打刻ページの操作候補を JSON で出す
 //     deno task in        # 入室打刻
 //     deno task out       # 退室打刻
 //
@@ -24,14 +31,22 @@
 //   状態ファイル（日付 × phase）で 1 日 1 回に抑える。判定材料が自分の
 //   ファイルなので、壊れるときは必ず「打刻しようとして失敗」＝気付ける方向。
 //
-// ★ 失敗は必ず可視化する。ボタンが見つからない / セッション切れは
-//   スクリーンショットを残して非 0 で終了し、呼び出し側（kanade job）が
-//   ntfy で通知する。黙って何もしないのが最悪の失敗様態。
+// ★ 失敗は必ず可視化する。ログイン失敗 / ボタンが見つからないはスクリーン
+//   ショットを残して非 0 で終了し、呼び出し側（kanade job）が ntfy で
+//   通知する。黙って何もしないのが最悪の失敗様態。
 
 import { type BrowserContext, chromium, type Page } from "playwright";
 
 const SIGN_IN = "https://id.jobcan.jp/users/sign_in";
 const EMPLOYEE = "https://ssl.jobcan.jp/employee";
+// id.jobcan.jp へのログインだけでは打刻ドメイン（ssl.jobcan.jp）の認証は
+// 成立しない。/employee に直接行くと会社ID入力を求める別のスタッフ用ログイン
+// 画面に押し戻される（実機確認済み）。この OAuth ブリッジを踏んで初めて
+// 打刻ドメインのセッションが張られる。
+const JBCOAUTH_LOGIN = "https://ssl.jobcan.jp/jbcoauth/login";
+
+const EMAIL_FILE = "jobcan-email.txt";
+const PASSWORD_FILE = "jobcan-password.txt";
 
 /** 押したいボタンの候補ラベル。会社ごとに打刻区分の名称が違う（入室/退室 の
  *  ところと 出勤/退勤 のところがある）ので、両方を順に試す。 */
@@ -79,8 +94,8 @@ async function open(headless: boolean): Promise<BrowserContext> {
   //   既定は chrome。Edge にしたい / Chrome が無い環境では
   //   DAKOKU_CHANNEL=msedge で切り替える。
   //
-  // ★ 永続コンテキスト = 専用の user-data-dir。Cookie も localStorage も
-  //   ここに残るので、login 後の status / in / out は headless で通る。
+  // ★ 永続コンテキスト = 専用の user-data-dir。認証セッションは毎回の
+  //   ログインで作るので、ここに残るのは Chromium 自体の設定だけ。
   //   普段使いのプロファイルとは別ディレクトリなので、普段のブラウザの
   //   ログイン状態やセッションには一切触らない。
   const channel = Deno.env.get("DAKOKU_CHANNEL") ?? "chrome";
@@ -93,17 +108,68 @@ async function open(headless: boolean): Promise<BrowserContext> {
   });
 }
 
-/** 打刻ページへ行き、ログイン済みであることを確認する。 */
+/** 打刻ページへ行き、ログイン済みであることを確認する。ログイン成功判定は
+ *  「打刻ページに到達できたか」そのもの — id.jobcan.jp に押し戻されたら
+ *  資格情報違い・CAPTCHA・画面構造の変化のいずれか。 */
 async function gotoEmployee(page: Page): Promise<void> {
   await page.goto(EMPLOYEE, { waitUntil: "domcontentloaded", timeout: 60_000 });
   await page.waitForLoadState("networkidle", { timeout: 60_000 }).catch(() => {});
   const url = page.url();
   if (/id\.jobcan\.jp|sign_in|login/i.test(url)) {
-    const path = await shot(page, "session-expired");
+    const path = await shot(page, "login-failed");
     throw new Error(
-      `SESSION_EXPIRED: redirected to ${url} — run \`deno task login\` (shot: ${path})`,
+      `LOGIN_FAILED: redirected to ${url} after sign-in — wrong credentials, CAPTCHA, ` +
+        `or page structure changed (shot: ${path})`,
     );
   }
+}
+
+function readCredential(filename: string): string {
+  const path = `${stateDir()}\\${filename}`;
+  let raw: string;
+  try {
+    raw = Deno.readTextFileSync(path);
+  } catch {
+    throw new Error(
+      `LOGIN_FAILED: credential file missing: ${path} — create it (plain text, one line)`,
+    );
+  }
+  const value = raw.trim();
+  if (!value) {
+    throw new Error(`LOGIN_FAILED: credential file is empty: ${path}`);
+  }
+  return value;
+}
+
+/** 毎回 ID/パスワードでサインインしてから打刻ページへ進む。フォームの
+ *  セレクタは id.jobcan.jp の実フォーム（#user_email / #user_password /
+ *  #login_button）に依存する固定値 — 変わったら LOGIN_FAILED で気付ける。 */
+async function login(page: Page): Promise<void> {
+  const email = readCredential(EMAIL_FILE);
+  const password = readCredential(PASSWORD_FILE);
+
+  await page.goto(SIGN_IN, { waitUntil: "domcontentloaded", timeout: 60_000 });
+  // 永続プロファイルに id.jobcan.jp 側のセッションだけが残っていると
+  // sign_in がそのままアカウント画面へ流れ、フォームが存在しないことがある
+  // （実機確認済み）。その場合はフォーム入力を飛ばして先へ進む。
+  if (await page.locator("#user_email").count() > 0) {
+    try {
+      await page.locator("#user_email").fill(email, { timeout: 15_000 });
+      await page.locator("#user_password").fill(password, { timeout: 15_000 });
+      await page.locator("#login_button").click({ timeout: 15_000 });
+      await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
+    } catch (e) {
+      const path = await shot(page, "login-form-error");
+      throw new Error(`LOGIN_FAILED: could not submit the sign-in form (${e}) (shot: ${path})`);
+    }
+  }
+
+  await page.goto(JBCOAUTH_LOGIN, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(
+    () => {},
+  );
+  await page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {});
+
+  await gotoEmployee(page);
 }
 
 /** ページ上の押せる要素のアクセシブル名を集める。DOM 構造に依存した
@@ -132,7 +198,7 @@ async function cmdStatus(): Promise<void> {
   const ctx = await open(true);
   try {
     const page = ctx.pages()[0] ?? await ctx.newPage();
-    await gotoEmployee(page);
+    await login(page);
     const names = await clickableNames(page);
     console.log(JSON.stringify({ ok: true, url: page.url(), clickable: names }, null, 2));
   } finally {
@@ -140,13 +206,14 @@ async function cmdStatus(): Promise<void> {
   }
 }
 
+/** 手動ログインの疎通確認用。status/in/out が使う自動ログイン（login 関数）
+ *  とは別経路 — ブラウザを表示して手で確認したいときのためだけに残す。 */
 async function cmdLogin(): Promise<void> {
   const ctx = await open(false);
   const page = ctx.pages()[0] ?? await ctx.newPage();
   await page.goto(SIGN_IN, { waitUntil: "domcontentloaded" });
-  console.log("browser opened — sign in manually (2FA included). waiting up to 10 min...");
-  // ログイン完了の判定は「打刻ページに到達できること」。id.jobcan.jp の
-  // 画面遷移は SSO 構成で変わるので、遷移そのものを当てにしない。
+  console.log("browser opened — sign in manually. waiting up to 10 min...");
+  // ログイン完了の判定は「打刻ページに到達できること」。
   const deadline = Date.now() + 10 * 60_000;
   while (Date.now() < deadline) {
     await page.waitForTimeout(3_000);
@@ -177,7 +244,7 @@ async function cmdPunch(phase: Phase, force: boolean): Promise<void> {
   const ctx = await open(true);
   try {
     const page = ctx.pages()[0] ?? await ctx.newPage();
-    await gotoEmployee(page);
+    await login(page);
 
     const before = await clickableNames(page);
     let clicked: string | null = null;
