@@ -262,9 +262,23 @@ async function cmdPunch(phase: Phase, force: boolean): Promise<void> {
     }
 
     if (!clicked) {
+      // このアカウント（および同種の設定の会社）は入室/退室で別ボタンを
+      // 持たず、単一の PUSH ボタン（id="adit-button-push", onclick で
+      // set_value('DEF') = 自動判定）だけを持つ。現在の打刻状態からサーバ
+      // 側が入室/退室を判定するので、個別ラベルが見つからなければ最終手段
+      // としてこれを押す（実機確認済み: 入室/出勤/退室/退勤 のいずれの
+      // テキストも存在せず "P U S H" のみ）。
+      const push = page.locator('#adit-button-push, button:has-text("PUSH")').first();
+      if (await push.count() > 0 && await push.isVisible().catch(() => false)) {
+        await push.click({ timeout: 15_000 });
+        clicked = "PUSH";
+      }
+    }
+
+    if (!clicked) {
       const path = await shot(page, `no-button-${phase}`);
       throw new Error(
-        `NO_BUTTON: none of ${JSON.stringify(LABELS[phase])} found. ` +
+        `NO_BUTTON: none of ${JSON.stringify(LABELS[phase])} or the PUSH button found. ` +
           `clickable=${JSON.stringify(before)} (shot: ${path})`,
       );
     }

@@ -5,7 +5,7 @@
   "tasks": {
     "login": "deno run -A main.ts login",
     "status": "deno run -A main.ts status",
-    "in": "deno run -A main.ts in",
+    "in": "deno run -A main.ts \"in\"",
     "out": "deno run -A main.ts out",
     "check": "deno check ./**/*.ts",
     "fmt": "deno fmt",
