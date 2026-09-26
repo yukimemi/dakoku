@@ -5,7 +5,7 @@
 // Last Change : 2026/09/14
 // =============================================================================
 //
-// ジョブカンの入室 / 退室打刻を minipc から実行する。
+// ジョブカンの入室 / 退室打刻を minipc（Windows）/ Mac から実行する。
 //
 // ★ ジョブカンのセッションは 30 分で切れる（サービス側の仕様）上、認証
 //   クッキーはセッションクッキー（expires=-1）でブラウザプロセスの終了と
@@ -14,7 +14,8 @@
 //   進む。ログインからボタンクリックまでは数十秒なので 30 分には十分
 //   間に合う。対象アカウントは ID/パスワードのみで SSO も 2FA も無い。
 //
-// ★ 資格情報をこのリポジトリに置かない。%LOCALAPPDATA%\kanade-dakoku\ 配下の
+// ★ 資格情報をこのリポジトリに置かない。stateDir()（Windows: %LOCALAPPDATA%\kanade-dakoku、
+//   macOS: ~/Library/Application Support/kanade-dakoku）配下の
 //   平文ファイル jobcan-email.txt / jobcan-password.txt から読む（ntfy の
 //   トークンファイルと同じディレクトリ・同じ扱い）。ファイルが無い/空なら
 //   設定漏れとして明示的なメッセージで異常終了する。
@@ -57,29 +58,47 @@ const LABELS: Record<Phase, string[]> = {
 
 type Phase = "in" | "out";
 
+/** 資格情報・マーカー・スクショ・Chrome プロファイルの置き場。
+ *  Windows: %LOCALAPPDATA%\kanade-dakoku（minipc の既存配置）、
+ *  macOS: ~/Library/Application Support/kanade-dakoku。
+ *  kanade_config の job/dakoku-*.yaml の $stateDir と必ず一致させること。 */
 function stateDir(): string {
-  const base = Deno.env.get("LOCALAPPDATA");
-  if (!base) throw new Error("LOCALAPPDATA is not set (Windows only)");
-  const dir = `${base}\\kanade-dakoku`;
+  let dir: string;
+  if (Deno.build.os === "windows") {
+    const base = Deno.env.get("LOCALAPPDATA");
+    if (!base) throw new Error("LOCALAPPDATA is not set");
+    dir = join(base, "kanade-dakoku");
+  } else if (Deno.build.os === "darwin") {
+    const home = Deno.env.get("HOME");
+    if (!home) throw new Error("HOME is not set");
+    dir = join(home, "Library", "Application Support", "kanade-dakoku");
+  } else {
+    throw new Error(`unsupported OS: ${Deno.build.os}`);
+  }
   Deno.mkdirSync(dir, { recursive: true });
   return dir;
 }
 
+/** OS のパス区切りで連結する（Windows だけバックスラッシュ）。 */
+function join(...parts: string[]): string {
+  return parts.join(Deno.build.os === "windows" ? "\\" : "/");
+}
+
 function profileDir(): string {
-  return `${stateDir()}\\chrome-profile`;
+  return join(stateDir(), "chrome-profile");
 }
 
 function markerPath(phase: Phase, now: Date): string {
   const d = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${
     String(now.getDate()).padStart(2, "0")
   }`;
-  return `${stateDir()}\\punched-${phase}-${d}.flg`;
+  return join(stateDir(), `punched-${phase}-${d}.flg`);
 }
 
 async function shot(page: Page, tag: string): Promise<string> {
-  const dir = `${stateDir()}\\shots`;
+  const dir = join(stateDir(), "shots");
   await Deno.mkdir(dir, { recursive: true });
-  const path = `${dir}\\${tag}-${new Date().toISOString().replaceAll(/[:.]/g, "-")}.png`;
+  const path = join(dir, `${tag}-${new Date().toISOString().replaceAll(/[:.]/g, "-")}.png`);
   await page.screenshot({ path, fullPage: true });
   return path;
 }
@@ -125,7 +144,7 @@ async function gotoEmployee(page: Page): Promise<void> {
 }
 
 function readCredential(filename: string): string {
-  const path = `${stateDir()}\\${filename}`;
+  const path = join(stateDir(), filename);
   let raw: string;
   try {
     raw = Deno.readTextFileSync(path);
